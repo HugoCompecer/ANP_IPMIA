@@ -51,7 +51,7 @@ class ANPClassifier:
     def load_states_data(self, states_dir: str = None):
         """Cargar datos de estados mexicanos."""
         if states_dir is None:
-            states_dir = r"mexico-geojson\2023\states"
+            states_dir = r"estados"
         
         try:
             state_files = [f for f in os.listdir(states_dir) if f.endswith('.json')]

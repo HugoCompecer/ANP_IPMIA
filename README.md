@@ -29,12 +29,11 @@ IPMIA/
 │       ├── 232_ANP-ITRF08_04072025.dbf
 │       ├── 232_ANP-ITRF08_04072025.shx
 │       └── 232_ANP-ITRF08_04072025.prj
-└── mexico-geojson/
-    └── 2023/
-        └── states/
-            ├── Aguascalientes.json
-            ├── Baja California.json
-            └── ... (todos los estados)
+└── estados/
+    ├── Aguascalientes.json
+    ├── Baja California.json
+    ├── Ciudad de México.json
+    └── ... (todos los estados mexicanos)
 ```
 
 ## 📖 Uso Básico
