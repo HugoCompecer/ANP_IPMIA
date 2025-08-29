@@ -1,0 +1,6 @@
+# Dependencias para el clasificador de Áreas Naturales Protegidas
+geopandas>=0.13.0
+pandas>=1.5.0
+shapely>=2.0.0
+fiona>=1.8.0
+pyproj>=3.4.0
