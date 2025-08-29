@@ -59,9 +59,13 @@ def test_api():
     for i, coord in enumerate(coordenadas_prueba, 3):
         try:
             print(f"\n{i}️⃣ Probando clasificación - {coord['desc']}...")
-            response = requests.get(
+            json_data = {
+                "latitud": coord["lat"],
+                "longitud": coord["lon"]
+            }
+            response = requests.post(
                 f"{BASE_URL}/clasificar",
-                params={"latitud": coord["lat"], "longitud": coord["lon"]}
+                json=json_data
             )
             
             if response.status_code == 200:
@@ -123,10 +127,16 @@ def ejemplo_uso_python():
     lat, lon = 20.5, -97.5
     
     try:
-        # Realizar petición
-        response = requests.get(
+        # Preparar datos JSON
+        json_data = {
+            "latitud": lat,
+            "longitud": lon
+        }
+        
+        # Realizar petición POST
+        response = requests.post(
             f"{BASE_URL}/clasificar",
-            params={"latitud": lat, "longitud": lon},
+            json=json_data,
             timeout=10
         )
         

@@ -24,6 +24,7 @@ IPMIA/
 ├── api.py                    # API REST con FastAPI
 ├── iniciar_api.py            # Script para iniciar la API
 ├── test_api.py               # Script de pruebas de la API
+├── ejemplo_post.py           # Ejemplos de uso POST con Python
 ├── requirements.txt          # Dependencias Python
 ├── README.md                 # Documentación
 ├── shape_files/
@@ -50,11 +51,15 @@ python iniciar_api.py
 
 **Clasificar coordenada:**
 ```bash
-# Ejemplo con curl
-curl "http://localhost:8000/clasificar?latitud=20.5&longitud=-97.5"
+# Ejemplo con curl (POST JSON)
+curl -X POST "http://localhost:8000/clasificar" \
+     -H "Content-Type: application/json" \
+     -d '{"latitud": 20.5, "longitud": -97.5}'
 
-# O desde el navegador:
-# http://localhost:8000/clasificar?latitud=20.5&longitud=-97.5
+# Ejemplo alternativo
+curl -X POST http://localhost:8000/clasificar \
+     -H "Content-Type: application/json" \
+     --data '{"latitud":20.5,"longitud":-97.5}'
 ```
 
 **Documentación interactiva:**
@@ -63,11 +68,38 @@ curl "http://localhost:8000/clasificar?latitud=20.5&longitud=-97.5"
 
 **Probar la API:**
 ```bash
+# Pruebas automatizadas de todos los endpoints
 python test_api.py
+
+# Ejemplos específicos de uso POST
+python ejemplo_post.py
 ```
 
 ### 📱 Uso Programático
 
+#### Opción 1: Via API (Recomendado)
+```python
+import requests
+
+# Enviar coordenadas via POST JSON
+datos = {
+    "latitud": 20.5,
+    "longitud": -97.5
+}
+
+response = requests.post(
+    "http://localhost:8000/clasificar",
+    json=datos
+)
+
+if response.status_code == 200:
+    resultado = response.json()
+    print(f"Clasificación MIA: {resultado['clasificacionMIA']}")
+    print(f"En ANP: {resultado['anp']['pertenece']}")
+    print(f"Colinda entre estados: {resultado['colindaEntreEstados']}")
+```
+
+#### Opción 2: Importación Directa
 ```python
 from anp_classifier import ANPClassifier
 
@@ -79,13 +111,8 @@ classifier.load_anp_data()
 classifier.load_states_data()
 
 # Analizar coordenada
-latitud = 20.5
-longitud = -97.5
-resultado = classifier.classify_coordinate(latitud, longitud)
-
+resultado = classifier.classify_coordinate(20.5, -97.5)
 print(f"Clasificación MIA: {resultado['clasificacionMIA']}")
-print(f"En ANP: {resultado['anp']['pertenece']}")
-print(f"Colinda entre estados: {resultado['colindaEntreEstados']}")
 ```
 
 ### 🖥️ Script Principal
@@ -121,7 +148,7 @@ Si está a < 2 km de un ANP de alto valor ecológico (RAMSAR, UNESCO, Reserva de
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/` | GET | Información general de la API |
-| `/clasificar` | GET | Clasificar coordenada (principal) |
+| `/clasificar` | **POST** | **Clasificar coordenada (principal)** |
 | `/health` | GET | Estado de salud de la API |
 | `/anp/lista` | GET | Listar ANPs con filtros |
 | `/categorias` | GET | Obtener categorías de manejo |
@@ -130,15 +157,27 @@ Si está a < 2 km de un ANP de alto valor ecológico (RAMSAR, UNESCO, Reserva de
 
 ### Parámetros del Endpoint Principal
 
-**`GET /clasificar`**
+**`POST /clasificar`**
+
+**Request Body (JSON):**
+```json
+{
+  "latitud": 20.5,
+  "longitud": -97.5
+}
+```
+
+**Parámetros:**
 - `latitud` (float, obligatorio): Latitud en grados decimales (14.5° a 32.7° N)
 - `longitud` (float, obligatorio): Longitud en grados decimales (-118.4° a -86.7° O)
 
 ### Ejemplos de Uso de la API
 
 ```bash
-# Clasificar coordenada específica
-curl "http://localhost:8000/clasificar?latitud=20.5&longitud=-97.5"
+# Clasificar coordenada específica (POST con JSON)
+curl -X POST "http://localhost:8000/clasificar" \
+     -H "Content-Type: application/json" \
+     -d '{"latitud": 20.5, "longitud": -97.5}'
 
 # Obtener estado de salud
 curl "http://localhost:8000/health"
@@ -271,6 +310,9 @@ python iniciar_api.py
 
 # Probar todos los endpoints
 python test_api.py
+
+# Ejemplos específicos POST
+python ejemplo_post.py
 
 # Ver documentación
 # http://localhost:8000/docs

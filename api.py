@@ -69,7 +69,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Modelos de respuesta
+# Modelos de request y respuesta
+class CoordenadasRequest(BaseModel):
+    latitud: float = Field(..., ge=14.5, le=32.7, description="Latitud de la coordenada (14.5° a 32.7° N para México)", example=20.5)
+    longitud: float = Field(..., ge=-118.4, le=-86.7, description="Longitud de la coordenada (-118.4° a -86.7° O para México)", example=-97.5)
+
 class CoordenadasModel(BaseModel):
     latitud: float = Field(..., description="Latitud de la coordenada")
     longitud: float = Field(..., description="Longitud de la coordenada")
@@ -106,7 +110,7 @@ async def root():
         "version": "1.0.0",
         "descripcion": "API para clasificación MIA según ubicación en ANPs",
         "endpoints": {
-            "clasificar": "/clasificar?latitud={lat}&longitud={lon}",
+            "clasificar": "POST /clasificar (JSON: {latitud, longitud})",
             "docs": "/docs",
             "salud": "/health"
         }
@@ -127,37 +131,31 @@ async def health_check():
         "estados_cargados": len(classifier.states_gdf.estado.unique()) if classifier.states_gdf is not None else 0
     }
 
-@app.get("/clasificar",
-         response_model=ClasificacionResponse,
-         summary="Clasificar coordenada",
-         description="Clasifica una coordenada según criterios MIA y verifica si está en ANP",
-         responses={
-             200: {"description": "Clasificación exitosa"},
-             400: {"model": ErrorResponse, "description": "Parámetros inválidos"},
-             500: {"model": ErrorResponse, "description": "Error interno del servidor"}
-         })
-async def clasificar_coordenada(
-    latitud: float = Query(
-        ..., 
-        ge=14.5, 
-        le=32.7,
-        description="Latitud de la coordenada (14.5° a 32.7° N para México)",
-        example=20.5
-    ),
-    longitud: float = Query(
-        ..., 
-        ge=-118.4, 
-        le=-86.7,
-        description="Longitud de la coordenada (-118.4° a -86.7° O para México)",
-        example=-97.5
-    )
-):
+@app.post("/clasificar",
+          response_model=ClasificacionResponse,
+          summary="Clasificar coordenada",
+          description="Clasifica una coordenada según criterios MIA y verifica si está en ANP",
+          responses={
+              200: {"description": "Clasificación exitosa"},
+              400: {"model": ErrorResponse, "description": "Parámetros inválidos"},
+              422: {"description": "Error de validación de datos"},
+              500: {"model": ErrorResponse, "description": "Error interno del servidor"}
+          })
+async def clasificar_coordenada(coordenadas: CoordenadasRequest):
     """
     Clasifica una coordenada geográfica según los criterios de MIA.
     
+    ## Request Body (JSON):
+    ```json
+    {
+        "latitud": 20.5,
+        "longitud": -97.5
+    }
+    ```
+    
     ## Parámetros:
-    - **latitud**: Latitud en grados decimales (WGS84)
-    - **longitud**: Longitud en grados decimales (WGS84)
+    - **latitud**: Latitud en grados decimales (WGS84) - Rango: 14.5° a 32.7° N
+    - **longitud**: Longitud en grados decimales (WGS84) - Rango: -118.4° a -86.7° O
     
     ## Clasificación MIA:
     1. **MIA Regional**: Si está ≤ 500m de límites estatales
@@ -178,7 +176,7 @@ async def clasificar_coordenada(
             )
         
         # Realizar clasificación
-        resultado = classifier.classify_coordinate(latitud, longitud)
+        resultado = classifier.classify_coordinate(coordenadas.latitud, coordenadas.longitud)
         
         # Verificar si hay errores en el resultado
         if "error" in resultado:
