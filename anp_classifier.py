@@ -38,7 +38,7 @@ class ANPClassifier:
     def load_anp_data(self, shapefile_path: str = None):
         """Cargar datos de áreas naturales protegidas."""
         if shapefile_path is None:
-            shapefile_path = r"shape_files\areas_naturales_protegidas\232_ANP-ITRF08_04072025.shp"
+            shapefile_path = os.path.join("shape_files", "areas_naturales_protegidas", "232_ANP-ITRF08_04072025.shp")
         
         try:
             self.anp_gdf = gpd.read_file(shapefile_path)
@@ -51,7 +51,7 @@ class ANPClassifier:
     def load_states_data(self, states_dir: str = None):
         """Cargar datos de estados mexicanos."""
         if states_dir is None:
-            states_dir = r"mexico-geojson\2023\states"
+            states_dir = "estados"
         
         try:
             state_files = [f for f in os.listdir(states_dir) if f.endswith('.json')]
