@@ -6,22 +6,34 @@ Autor: Sistema de clasificación ambiental
 Fecha: 2025
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 import uvicorn
 import pandas as pd
+import os
+import fitz  # PyMuPDF
+from PIL import Image, ImageFilter
+import cv2
+import numpy as np
+import easyocr
+from io import BytesIO
+from openai import OpenAI
+import json
+import time
 from anp_classifier import ANPClassifier
 
 # Variables globales para el clasificador
 classifier = None
+openai_client = None
+ocr_reader = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación."""
-    global classifier
+    global classifier, openai_client, ocr_reader
     
     # Startup: Cargar datos del clasificador
     print("🌿 Iniciando API de Clasificación de ANP...")
@@ -35,7 +47,24 @@ async def lifespan(app: FastAPI):
     if not classifier.load_states_data():
         raise Exception("❌ Error: No se pudieron cargar los datos de estados")
     
-    print("✅ Datos cargados correctamente")
+    print("✅ Datos de ANP cargados correctamente")
+    
+    # Inicializar cliente OpenAI (solo si hay API key)
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        openai_client = OpenAI(api_key=openai_api_key)
+        print("✅ Cliente OpenAI inicializado")
+    else:
+        print("⚠️  Variable OPENAI_API_KEY no encontrada - funciones OCR+GPT deshabilitadas")
+    
+    # Inicializar EasyOCR
+    try:
+        print("📖 Inicializando EasyOCR...")
+        ocr_reader = easyocr.Reader(['es', 'en'], gpu=False)  # GPU=False para compatibilidad
+        print("✅ EasyOCR inicializado")
+    except Exception as e:
+        print(f"⚠️  Error inicializando EasyOCR: {str(e)} - funciones OCR deshabilitadas")
+    
     print("🚀 API lista para recibir peticiones")
     
     yield
@@ -99,6 +128,25 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Descripción del error")
     detalle: Optional[str] = Field(None, description="Detalles adicionales del error")
 
+class ArchivoResponse(BaseModel):
+    mensaje: str = Field(..., description="Mensaje de confirmación")
+    nombre_archivo: str = Field(..., description="Nombre del archivo subido")
+    tamaño_archivo: int = Field(..., description="Tamaño del archivo en bytes")
+    tipo_contenido: Optional[str] = Field(None, description="Tipo MIME del archivo")
+    texto_enviado: str = Field(..., description="String enviado junto con el archivo")
+    ruta_guardado: Optional[str] = Field(None, description="Ruta donde se guardó el archivo")
+
+class OCRAnalisisResponse(BaseModel):
+    mensaje: str = Field(..., description="Mensaje de confirmación del procesamiento")
+    nombre_archivo: str = Field(..., description="Nombre del archivo procesado")
+    tamaño_archivo: int = Field(..., description="Tamaño del archivo en bytes")
+    tipo_contenido: Optional[str] = Field(None, description="Tipo MIME del archivo")
+    prompt_usuario: str = Field(..., description="Prompt/consulta del usuario")
+    texto_extraido: str = Field(..., description="Texto completo extraído por OCR")
+    analisis_gpt: Optional[str] = Field(None, description="Análisis estructurado por GPT-4o-mini")
+    tiempo_procesamiento: float = Field(..., description="Tiempo total de procesamiento en segundos")
+    detalles_procesamiento: Dict = Field(..., description="Detalles del procesamiento realizado")
+
 # Endpoints
 @app.get("/", 
          summary="Información de la API",
@@ -111,6 +159,10 @@ async def root():
         "descripcion": "API para clasificación MIA según ubicación en ANPs",
         "endpoints": {
             "clasificar": "POST /clasificar (JSON: {latitud, longitud})",
+            "subir-archivo": "POST /subir-archivo (Form: archivo + texto)",
+            "analizar-documento": "POST /analizar-documento (Form: archivo + prompt)",
+            "anp/lista": "GET /anp/lista (filtrar ANPs)",
+            "categorias": "GET /categorias (categorías de ANP)",
             "docs": "/docs",
             "salud": "/health"
         }
@@ -276,6 +328,303 @@ async def obtener_categorias():
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error obteniendo categorías: {str(e)}")
+
+@app.post("/subir-archivo",
+          response_model=ArchivoResponse,
+          summary="Subir archivo con texto",
+          description="Endpoint para subir un archivo junto con un string de texto",
+          responses={
+              200: {"description": "Archivo subido exitosamente"},
+              400: {"model": ErrorResponse, "description": "Error en los parámetros enviados"},
+              413: {"model": ErrorResponse, "description": "Archivo demasiado grande"},
+              500: {"model": ErrorResponse, "description": "Error interno del servidor"}
+          })
+async def subir_archivo_con_texto(
+    archivo: UploadFile = File(..., description="Archivo a subir"),
+    texto: str = Form(..., description="Texto o string a enviar junto con el archivo"),
+    guardar_archivo: bool = Form(False, description="Si debe guardarse el archivo en el servidor")
+):
+    """
+    Endpoint para subir un archivo junto con un string de texto.
+    
+    ## Parámetros:
+    - **archivo**: Archivo a subir (cualquier tipo)
+    - **texto**: String o texto a enviar junto con el archivo
+    - **guardar_archivo**: Opcional, indica si el archivo debe guardarse en el servidor (default: False)
+    
+    ## Restricciones:
+    - Tamaño máximo de archivo: 50MB
+    - Tipos de archivo permitidos: Todos
+    
+    ## Respuesta:
+    - Información del archivo subido
+    - El texto enviado
+    - Ruta de guardado (si se especificó guardar_archivo=True)
+    
+    ## Ejemplo de uso:
+    ```bash
+    curl -X POST "http://localhost:8000/subir-archivo" \\
+         -F "archivo=@mi_archivo.txt" \\
+         -F "texto=Mi texto personalizado" \\
+         -F "guardar_archivo=true"
+    ```
+    """
+    
+    try:
+        # Verificar tamaño del archivo (50MB máximo)
+        max_size = 50 * 1024 * 1024  # 50MB en bytes
+        
+        # Leer el contenido del archivo para obtener su tamaño
+        contenido = await archivo.read()
+        tamaño_archivo = len(contenido)
+        
+        if tamaño_archivo > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Archivo demasiado grande. Tamaño máximo: 50MB. Tamaño actual: {tamaño_archivo / 1024 / 1024:.2f}MB"
+            )
+        
+        ruta_guardado = None
+        
+        # Si se especifica guardar el archivo
+        if guardar_archivo:
+            # Crear directorio de uploads si no existe
+            directorio_uploads = "uploads"
+            if not os.path.exists(directorio_uploads):
+                os.makedirs(directorio_uploads)
+            
+            # Generar nombre único para evitar sobrescribir
+            import time
+            timestamp = str(int(time.time()))
+            nombre_unico = f"{timestamp}_{archivo.filename}"
+            ruta_guardado = os.path.join(directorio_uploads, nombre_unico)
+            
+            # Guardar el archivo
+            with open(ruta_guardado, "wb") as f:
+                f.write(contenido)
+        
+        # Preparar respuesta
+        respuesta = ArchivoResponse(
+            mensaje="Archivo procesado exitosamente",
+            nombre_archivo=archivo.filename,
+            tamaño_archivo=tamaño_archivo,
+            tipo_contenido=archivo.content_type,
+            texto_enviado=texto,
+            ruta_guardado=ruta_guardado
+        )
+        
+        return respuesta
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando archivo: {str(e)}"
+        )
+
+@app.post("/analizar-documento",
+          response_model=OCRAnalisisResponse,
+          summary="Analizar documento con OCR + GPT",
+          description="Extrae texto de documentos (PDF/imágenes) y analiza el contenido usando GPT-4o-mini",
+          responses={
+              200: {"description": "Análisis completado exitosamente"},
+              400: {"model": ErrorResponse, "description": "Error en los parámetros enviados"},
+              413: {"model": ErrorResponse, "description": "Archivo demasiado grande"},
+              503: {"model": ErrorResponse, "description": "Servicios OCR/GPT no disponibles"},
+              500: {"model": ErrorResponse, "description": "Error interno del servidor"}
+          })
+async def analizar_documento_ocr_gpt(
+    archivo: UploadFile = File(..., description="Documento a analizar (PDF, JPG, JPEG, PNG)"),
+    prompt: str = Form(..., description="Consulta o datos específicos que quieres encontrar en el documento"),
+    modelo_gpt: str = Form("gpt-4o-mini", description="Modelo GPT a usar (gpt-4o-mini, gpt-4o)")
+):
+    """
+    Analiza documentos usando OCR avanzado y GPT para extraer información específica.
+    
+    ## Proceso:
+    1. **Carga del documento**: Acepta PDF, JPG, JPEG, PNG
+    2. **Procesamiento de imagen**: Mejora la calidad para OCR óptimo
+    3. **Extracción OCR**: Usa EasyOCR con preprocesamiento avanzado
+    4. **Análisis GPT**: Interpreta el texto según tu consulta específica
+    
+    ## Parámetros:
+    - **archivo**: Documento a procesar (PDF se convierte a imagen de alta resolución)
+    - **prompt**: Consulta específica (ej: "coordenadas y dimensiones del terreno")
+    - **modelo_gpt**: Modelo OpenAI a usar (default: gpt-4o-mini)
+    
+    ## Tipos de archivo soportados:
+    - **PDF**: Se renderiza la primera página a 400 DPI
+    - **JPG/JPEG/PNG**: Se procesan directamente
+    
+    ## Restricciones:
+    - Tamaño máximo: 50MB
+    - Requiere variables de entorno: OPENAI_API_KEY
+    
+    ## Ejemplo de uso:
+    ```bash
+    curl -X POST "http://localhost:8000/analizar-documento" \\
+         -F "archivo=@plano_arquitectonico.pdf" \\
+         -F "prompt=Extrae las coordenadas UTM y dimensiones del terreno"
+    ```
+    """
+    
+    inicio_tiempo = time.time()
+    detalles = {"pasos_completados": []}
+    
+    try:
+        # Verificaciones iniciales
+        if ocr_reader is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Servicio OCR no disponible. EasyOCR no se pudo inicializar."
+            )
+        
+        if openai_client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Servicio GPT no disponible. Configure la variable OPENAI_API_KEY."
+            )
+        
+        # Verificar tipo de archivo
+        tipos_soportados = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png']
+        if archivo.content_type not in tipos_soportados and not archivo.filename.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tipo de archivo no soportado. Use: PDF, JPG, JPEG, PNG"
+            )
+        
+        # Leer archivo
+        contenido = await archivo.read()
+        tamaño_archivo = len(contenido)
+        
+        # Verificar tamaño (50MB máximo)
+        max_size = 50 * 1024 * 1024
+        if tamaño_archivo > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Archivo demasiado grande. Máximo: 50MB. Actual: {tamaño_archivo / 1024 / 1024:.2f}MB"
+            )
+        
+        detalles["pasos_completados"].append("✅ Archivo cargado y validado")
+        
+        # 🔄 PASO 1: Procesamiento del archivo a imagen
+        if archivo.content_type == 'application/pdf' or archivo.filename.lower().endswith('.pdf'):
+            # Procesar PDF
+            doc = fitz.open(stream=contenido, filetype="pdf")
+            page = doc[0]  # Primera página
+            zoom = 4  # Resolución muy alta
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, dpi=400)
+            img_bytes = pix.tobytes("png")
+            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+            doc.close()
+            detalles["pasos_completados"].append("✅ PDF convertido a imagen de alta resolución (400 DPI)")
+        else:
+            # Procesar imagen
+            img = Image.open(BytesIO(contenido)).convert("RGB")
+            detalles["pasos_completados"].append("✅ Imagen cargada y convertida a RGB")
+        
+        # 🔄 PASO 2: Preprocesamiento avanzado con OpenCV
+        img_cv = np.array(img)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
+        
+        # Mejorar contraste local con CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        
+        # Aplicar filtro de mediana para reducir ruido
+        gray = cv2.medianBlur(gray, 3)
+        
+        # Binarización adaptativa más precisa
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            25, 2
+        )
+        
+        # Morfología para mejorar trazos de caracteres
+        kernel = np.ones((2, 2), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        
+        # Filtro de nitidez con PIL
+        img_proc = Image.fromarray(thresh).filter(
+            ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3)
+        )
+        
+        detalles["pasos_completados"].append("✅ Imagen preprocesada con OpenCV (CLAHE, filtros, binarización)")
+        
+        # 🔄 PASO 3: OCR con EasyOCR
+        results = ocr_reader.readtext(np.array(img_proc), detail=1, paragraph=True)
+        ocr_text = "\n".join([res[1] for res in results if res[2] > 0.5])  # Solo confianza > 50%
+        
+        if not ocr_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="No se pudo extraer texto del documento. Verifica la calidad de la imagen."
+            )
+        
+        detalles["pasos_completados"].append(f"✅ Texto extraído con EasyOCR ({len(results)} elementos detectados)")
+        detalles["caracteres_extraidos"] = len(ocr_text)
+        
+        # 🔄 PASO 4: Análisis con GPT
+        prompt_completo = f"""
+Eres un experto en interpretación de planos y documentos oficiales.
+Del siguiente texto extraído del documento, devuelve únicamente un JSON con los valores referentes a: {prompt}
+
+Texto extraído del documento:
+{ocr_text}
+
+Instrucciones:
+- Solo responde con JSON válido, sin explicaciones ni etiquetas de código
+- Si no encuentras la información solicitada, indica "no_encontrado": true
+- Estructura la respuesta de forma clara y organizada
+- Incluye unidades de medida cuando aplique
+"""
+        
+        messages = [
+            {"role": "system", "content": "Eres un experto en interpretación de documentos oficiales y planos técnicos."},
+            {"role": "user", "content": prompt_completo}
+        ]
+        
+        response = openai_client.chat.completions.create(
+            model=modelo_gpt,
+            messages=messages,
+            temperature=0.1  # Respuestas más precisas y consistentes
+        )
+        
+        analisis_gpt = response.choices[0].message.content
+        detalles["pasos_completados"].append(f"✅ Análisis completado con {modelo_gpt}")
+        detalles["tokens_utilizados"] = response.usage.total_tokens if hasattr(response, 'usage') else 0
+        
+        # Calcular tiempo total
+        tiempo_total = time.time() - inicio_tiempo
+        
+        # Preparar respuesta
+        return OCRAnalisisResponse(
+            mensaje="Documento analizado exitosamente",
+            nombre_archivo=archivo.filename,
+            tamaño_archivo=tamaño_archivo,
+            tipo_contenido=archivo.content_type,
+            prompt_usuario=prompt,
+            texto_extraido=ocr_text,
+            analisis_gpt=analisis_gpt,
+            tiempo_procesamiento=tiempo_total,
+            detalles_procesamiento=detalles
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        tiempo_error = time.time() - inicio_tiempo
+        detalles["error_en_paso"] = len(detalles["pasos_completados"])
+        detalles["tiempo_hasta_error"] = tiempo_error
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando documento: {str(e)}"
+        )
 
 # Función para ejecutar la API
 def run_api():
