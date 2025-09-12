@@ -10,34 +10,34 @@ from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import uvicorn
 import pandas as pd
 import os
-import fitz  # PyMuPDF
-from PIL import Image, ImageFilter
-import cv2
-import numpy as np
-import easyocr
-from io import BytesIO
-from openai import OpenAI
-import json
-import time
 from anp_classifier import ANPClassifier
+from services import DocumentAnalyzer
+from dotenv import load_dotenv
+import logging
+import uuid
 
-# Variables globales para el clasificador
+# Variables globales para el clasificador y análisis de documentos
 classifier = None
-openai_client = None
-ocr_reader = None
+document_analyzer = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación."""
-    global classifier, openai_client, ocr_reader
+    global classifier, document_analyzer
     
     # Startup: Cargar datos del clasificador
     print("🌿 Iniciando API de Clasificación de ANP...")
     print("📂 Cargando datos...")
+    # Cargar variables de entorno desde .env si existe
+    try:
+        load_dotenv()
+        print("🔐 Variables de entorno cargadas (.env)")
+    except Exception:
+        pass
     
     classifier = ANPClassifier()
     
@@ -49,21 +49,17 @@ async def lifespan(app: FastAPI):
     
     print("✅ Datos de ANP cargados correctamente")
     
-    # Inicializar cliente OpenAI (solo si hay API key)
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if openai_api_key:
-        openai_client = OpenAI(api_key=openai_api_key)
-        print("✅ Cliente OpenAI inicializado")
+    # Inicializar servicio de análisis de documentos (OCR + GPT)
+    document_analyzer = DocumentAnalyzer()
+    init_detalles = document_analyzer.initialize(os.getenv("OPENAI_API_KEY"), gpu=False)
+    if document_analyzer.is_ocr_ready:
+        print("✅ Servicio OCR listo")
     else:
-        print("⚠️  Variable OPENAI_API_KEY no encontrada - funciones OCR+GPT deshabilitadas")
-    
-    # Inicializar EasyOCR
-    try:
-        print("📖 Inicializando EasyOCR...")
-        ocr_reader = easyocr.Reader(['es', 'en'], gpu=False)  # GPU=False para compatibilidad
-        print("✅ EasyOCR inicializado")
-    except Exception as e:
-        print(f"⚠️  Error inicializando EasyOCR: {str(e)} - funciones OCR deshabilitadas")
+        print("⚠️  Servicio OCR no disponible")
+    if document_analyzer.is_gpt_ready:
+        print("✅ Servicio GPT listo")
+    else:
+        print("⚠️  Servicio GPT no disponible (configure OPENAI_API_KEY)")
     
     print("🚀 API lista para recibir peticiones")
     
@@ -97,6 +93,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Configurar logging básico
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger("api")
 
 # Modelos de request y respuesta
 class CoordenadasRequest(BaseModel):
@@ -143,7 +143,8 @@ class OCRAnalisisResponse(BaseModel):
     tipo_contenido: Optional[str] = Field(None, description="Tipo MIME del archivo")
     prompt_usuario: str = Field(..., description="Prompt/consulta del usuario")
     texto_extraido: str = Field(..., description="Texto completo extraído por OCR")
-    analisis_gpt: Optional[str] = Field(None, description="Análisis estructurado por GPT-4o-mini")
+    analisis_gpt: Optional[str] = Field(None, description="Salida cruda de GPT-4o-mini (texto)")
+    analisis_gpt_json: Any = Field(None, description="Salida de GPT parseada a JSON (garantizado JSON serializable)")
     tiempo_procesamiento: float = Field(..., description="Tiempo total de procesamiento en segundos")
     detalles_procesamiento: Dict = Field(..., description="Detalles del procesamiento realizado")
 
@@ -180,7 +181,9 @@ async def health_check():
         "estado": "saludable",
         "clasificador": "activo",
         "anp_cargadas": len(classifier.anp_gdf) if classifier.anp_gdf is not None else 0,
-        "estados_cargados": len(classifier.states_gdf.estado.unique()) if classifier.states_gdf is not None else 0
+        "estados_cargados": len(classifier.states_gdf.estado.unique()) if classifier.states_gdf is not None else 0,
+        "ocr": "listo" if (document_analyzer is not None and document_analyzer.is_ocr_ready) else "no_disponible",
+        "gpt": "listo" if (document_analyzer is not None and document_analyzer.is_gpt_ready) else "no_disponible"
     }
 
 @app.post("/clasificar",
@@ -424,7 +427,7 @@ async def subir_archivo_con_texto(
         )
 
 @app.post("/analizar-documento",
-          response_model=OCRAnalisisResponse,
+          response_model=Any,
           summary="Analizar documento con OCR + GPT",
           description="Extrae texto de documentos (PDF/imágenes) y analiza el contenido usando GPT-4o-mini",
           responses={
@@ -469,162 +472,54 @@ async def analizar_documento_ocr_gpt(
     ```
     """
     
-    inicio_tiempo = time.time()
-    detalles = {"pasos_completados": []}
-    
     try:
         # Verificaciones iniciales
-        if ocr_reader is None:
+        if document_analyzer is None or not document_analyzer.is_ocr_ready:
             raise HTTPException(
                 status_code=503,
                 detail="Servicio OCR no disponible. EasyOCR no se pudo inicializar."
             )
         
-        if openai_client is None:
+        if not document_analyzer.is_gpt_ready:
             raise HTTPException(
                 status_code=503,
                 detail="Servicio GPT no disponible. Configure la variable OPENAI_API_KEY."
             )
         
-        # Verificar tipo de archivo
-        tipos_soportados = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png']
-        if archivo.content_type not in tipos_soportados and not archivo.filename.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Tipo de archivo no soportado. Use: PDF, JPG, JPEG, PNG"
-            )
-        
-        # Leer archivo
+        # Leer archivo a bytes y validaciones básicas
         contenido = await archivo.read()
-        tamaño_archivo = len(contenido)
-        
-        # Verificar tamaño (50MB máximo)
-        max_size = 50 * 1024 * 1024
-        if tamaño_archivo > max_size:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Archivo demasiado grande. Máximo: 50MB. Actual: {tamaño_archivo / 1024 / 1024:.2f}MB"
-            )
-        
-        detalles["pasos_completados"].append("✅ Archivo cargado y validado")
-        
-        # 🔄 PASO 1: Procesamiento del archivo a imagen
-        if archivo.content_type == 'application/pdf' or archivo.filename.lower().endswith('.pdf'):
-            # Procesar PDF
-            doc = fitz.open(stream=contenido, filetype="pdf")
-            page = doc[0]  # Primera página
-            zoom = 4  # Resolución muy alta
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, dpi=400)
-            img_bytes = pix.tobytes("png")
-            img = Image.open(BytesIO(img_bytes)).convert("RGB")
-            doc.close()
-            detalles["pasos_completados"].append("✅ PDF convertido a imagen de alta resolución (400 DPI)")
-        else:
-            # Procesar imagen
-            img = Image.open(BytesIO(contenido)).convert("RGB")
-            detalles["pasos_completados"].append("✅ Imagen cargada y convertida a RGB")
-        
-        # 🔄 PASO 2: Preprocesamiento avanzado con OpenCV
-        img_cv = np.array(img)
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-        
-        # Mejorar contraste local con CLAHE
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-        
-        # Aplicar filtro de mediana para reducir ruido
-        gray = cv2.medianBlur(gray, 3)
-        
-        # Binarización adaptativa más precisa
-        thresh = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            25, 2
-        )
-        
-        # Morfología para mejorar trazos de caracteres
-        kernel = np.ones((2, 2), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        # Filtro de nitidez con PIL
-        img_proc = Image.fromarray(thresh).filter(
-            ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3)
-        )
-        
-        detalles["pasos_completados"].append("✅ Imagen preprocesada con OpenCV (CLAHE, filtros, binarización)")
-        
-        # 🔄 PASO 3: OCR con EasyOCR
-        results = ocr_reader.readtext(np.array(img_proc), detail=1, paragraph=True)
-        ocr_text = "\n".join([res[1] for res in results if res[2] > 0.5])  # Solo confianza > 50%
-        
-        if not ocr_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="No se pudo extraer texto del documento. Verifica la calidad de la imagen."
-            )
-        
-        detalles["pasos_completados"].append(f"✅ Texto extraído con EasyOCR ({len(results)} elementos detectados)")
-        detalles["caracteres_extraidos"] = len(ocr_text)
-        
-        # 🔄 PASO 4: Análisis con GPT
-        prompt_completo = f"""
-Eres un experto en interpretación de planos y documentos oficiales.
-Del siguiente texto extraído del documento, devuelve únicamente un JSON con los valores referentes a: {prompt}
+        if len(contenido) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Archivo demasiado grande. Máximo 50MB")
 
-Texto extraído del documento:
-{ocr_text}
+        try:
+            request_id = str(uuid.uuid4())
+            resultado = document_analyzer.analyze_document(
+                file_bytes=contenido,
+                filename=archivo.filename,
+                content_type=archivo.content_type or "",
+                prompt=prompt,
+                model=modelo_gpt,
+                request_id=request_id,
+            )
+        except ValueError as e:
+            # Errores de usuario: archivo inválido, sin texto, PDF vacío, etc.
+            logger.warning("[%s] 400: %s", request_id, e)
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            # Errores de servicios externos (OpenAI) u otros runtime
+            logger.error("[%s] 503: %s", request_id, e)
+            raise HTTPException(status_code=503, detail=str(e))
 
-Instrucciones:
-- Solo responde con JSON válido, sin explicaciones ni etiquetas de código
-- Si no encuentras la información solicitada, indica "no_encontrado": true
-- Estructura la respuesta de forma clara y organizada
-- Incluye unidades de medida cuando aplique
-"""
-        
-        messages = [
-            {"role": "system", "content": "Eres un experto en interpretación de documentos oficiales y planos técnicos."},
-            {"role": "user", "content": prompt_completo}
-        ]
-        
-        response = openai_client.chat.completions.create(
-            model=modelo_gpt,
-            messages=messages,
-            temperature=0.1  # Respuestas más precisas y consistentes
-        )
-        
-        analisis_gpt = response.choices[0].message.content
-        detalles["pasos_completados"].append(f"✅ Análisis completado con {modelo_gpt}")
-        detalles["tokens_utilizados"] = response.usage.total_tokens if hasattr(response, 'usage') else 0
-        
-        # Calcular tiempo total
-        tiempo_total = time.time() - inicio_tiempo
-        
-        # Preparar respuesta
-        return OCRAnalisisResponse(
-            mensaje="Documento analizado exitosamente",
-            nombre_archivo=archivo.filename,
-            tamaño_archivo=tamaño_archivo,
-            tipo_contenido=archivo.content_type,
-            prompt_usuario=prompt,
-            texto_extraido=ocr_text,
-            analisis_gpt=analisis_gpt,
-            tiempo_procesamiento=tiempo_total,
-            detalles_procesamiento=detalles
-        )
+        analisis = resultado.get("analisis_gpt_json")
+        if analisis is None:
+            logger.error("[%s] 502: No se pudo parsear JSON desde la salida de GPT", request_id)
+            raise HTTPException(status_code=502, detail="No se pudo parsear JSON desde la salida de GPT")
+        return analisis
         
     except HTTPException:
         raise
     except Exception as e:
-        tiempo_error = time.time() - inicio_tiempo
-        detalles["error_en_paso"] = len(detalles["pasos_completados"])
-        detalles["tiempo_hasta_error"] = tiempo_error
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error procesando documento: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error procesando documento: {str(e)}")
 
 # Función para ejecutar la API
 def run_api():
