@@ -2,6 +2,12 @@ import os
 import time
 import logging
 from typing import Dict, Tuple, Optional
+import ssl
+import certifi
+
+# Configurar certificados SSL para macOS
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+ssl._create_default_https_context = lambda: ssl_context
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageFilter
